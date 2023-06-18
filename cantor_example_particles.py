@@ -1,5 +1,11 @@
 """
-Extract example particles for Cantor plots
+Extract example particles for Cantor plots.
+
+It extracts the particles identified by Cantor for one specific galaxy
+(currently hard-coded as CE-29//G3272), and additionally identifies
+those particles that are found by Subfind, and that are in the same
+galaxy in the previous snapshot and the "reference" snapshot of the galaxy
+(when it was last a central?).
 """
 
 import numpy as np
