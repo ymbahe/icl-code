@@ -46,18 +46,18 @@ PartType[x]/ParentRootGalaxy   --> As RootGalaxy, but for gas parent particle
 """
 
 import numpy as np
-import sim_tools as st
-import yb_utils as yb
 from astropy.io import ascii
 from pdb import set_trace
 import calendar
 import time
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ModuleNotFoundError:
+    print("Not using MPI...")
+    MPI = None
 import os
-import hydrangea_tools as ht
-import eagle_routines as er
+import hydrangea as hy
 import sys
-import ctypes as c
 from scipy.interpolate import interp1d
 from astropy.cosmology import Planck13
 
@@ -66,14 +66,13 @@ from hydrangea import hdf5 as hd
 
 simname = "Hydrangea"     # 'Eagle' or 'Hydrangea'
 runtype = "HYDRO"         # 'HYDRO' or 'DM'
-ptypeList = [1]           # List of particle types to process
+ptypeList = [4]           # List of particle types to process
 
 # File name of the Cantor Catalogue to use:
 cantorCatalogue = 'CantorCatalogue.hdf5' 
 
 # File name of *cluster* catalogue to use as input:
-clusterCatalogue = ('/virgo/scratch/ybahe/HYDRANGEA/RESULTS/ICL/' 
-                    'cluster_catalogue_z0_22Jul19.hdf5')
+clusterCatalogue = ('../cluster_catalogue_z0_22Jul19_merge1p10_wSFR.hdf5')
 
 # Next line specifies the minimum mass of a subhalo to be considered as 
 # 'containing' a particle, in units of the particle's z = 0 host.
@@ -97,6 +96,8 @@ forgetful_parents = True
 # they are associated, or to the last one to which they belong before they
 # join their final (z = 0) galaxy.
 rootType = 'last'  # 'first' (first SH association) or 'last' (before final) 
+
+record_assembly = False
 
 # --------- Options for origin code determination -------------
 
@@ -128,6 +129,9 @@ age_nbins = 1     # no outliers here
 root_lograd_range = [-4, 0.5]
 root_lograd_nbins = 3     # incl. 2 outliers
 
+assembly_lograd_range = [-3, 0.5]
+assembly_lograd_nbins = 3
+
 # Scale root radius by stellar half mass radius?
 scale_root_lograd = False
 
@@ -139,7 +143,7 @@ use_initial_mass = False
 use_metal_mass = False
 
 # Limit parent tracing to x Gyr prior to star formation time?
-parent_limit = 2.0
+parent_limit = None #2.0
 
 # Set the level at which galaxies have to be uncontaminated to count as roots
 contFlagLevel = 1
@@ -169,14 +173,14 @@ else:
 
 ptype_names = ['Gas', 'DM', '', '', 'Stars', 'BHs']
 
-outloc = ('/virgo/scratch/ybahe/HYDRANGEA/RESULTS/ICL/' +
-          'OriginMasses_20Sep19_HostCat_RootXTopGal_HostRad7_lastroot_noxd_DM')
+outloc = ('../'
+          'OriginMasses_Test')
 
 # =============================================================================
 
 
 def find_galaxy_for_ids(sim, ids, isnap, ptype=None, ptype_offset=None,
-                        check_cont=False, return_rad = False):
+                        check_cont=False, return_rad=False):
     """
     Identify the galaxies that host input particle IDs in a given snapshot.
 
@@ -242,7 +246,8 @@ def find_galaxy_for_ids(sim, ids, isnap, ptype=None, ptype_offset=None,
     ca_ids = hd.read_data(cantoridloc, 'IDs')
     ca_offset = hd.read_data(cantorloc, 'Subhalo/Offset')
     ca_length = hd.read_data(cantorloc, 'Subhalo/Length')
-    ca_offset_type = hd.read_hdf5(cantorloc, 'Subhalo/OffsetType')
+    ca_offset_type = hd.read_data(cantorloc, 'Subhalo/OffsetType')
+    ca_shi_gal = hd.read_data(cantorloc, 'Subhalo/Galaxy')
 
     # The offset_type list has a coda in the second index (ptypes), so that we
     # can just subtract subsequent offsets to get the corresponding lengths
@@ -261,7 +266,7 @@ def find_galaxy_for_ids(sim, ids, isnap, ptype=None, ptype_offset=None,
     
     # First mode: consider only particles of one (real) type.
     if ptype is not None:
-        ca_shi = hy.crossref.ind_to_block(
+        ca_shi = hy.ind_to_block(
             ca_inds, ca_offset_type[:, ptype], ca_length_type[:, ptype])
 
     # Second mode: combined particle list, treat different types separately.
@@ -272,7 +277,7 @@ def find_galaxy_for_ids(sim, ids, isnap, ptype=None, ptype_offset=None,
                 start_pt = ptype_offset[iptype]
                 end_pt = ptype_offset[iptype+1]
                 ca_shi[start_pt:end_pt] = (
-                    hy.crossref.ind_to_block(
+                    hy.ind_to_block(
                         ca_inds[start_pt:end_pt],
                         ca_offset_type[:, iptype],
                         ca_length_type[:, iptype]
@@ -283,24 +288,23 @@ def find_galaxy_for_ids(sim, ids, isnap, ptype=None, ptype_offset=None,
         # particle types within a galaxy (typically for parent finding).
         # Note that we use the unsplit offset/length lists here.
         ca_shi[ptype_offset[6]:] = (
-            hy.crossref.ind_to_block(
+            hy.ind_to_block(
                 ca_inds[ptype_offset[6]:], ca_offset, ca_length)
         )
 
     # Third mode: no particle types, consider all entries for all galaxies.
     # This is the most straightforward case of all.
     else:
-        ca_shi = hy.crossref.ind_to_block(ca_inds, ca_offset, ca_length)
+        ca_shi = hy.ind_to_block(ca_inds, ca_offset, ca_length)
 
     # Last bit is mode-independent: find particles in subhaloes, and 
     # convert SHI --> galaxy for these. If desired, artificially treat
     # particles in contaminated galaxies as not in a galaxy.
     ind_in_gal = np.nonzero(ca_shi >= 0)[0]
     if check_cont:
-        subind_clean = np.nonzero(galContFlag[ca_gal[ind_in_gal]] == 0)[0]
+        subind_clean = np.nonzero(contFlag[ca_shi_gal[ca_shi[ind_in_gal]]] == 0)[0]
         ind_in_gal = ind_in_gal[subind_clean]
 
-    ca_shi_gal = hd.read_data(cantorloc, pre + '/Subhalo/Galaxy')
     ca_gal = np.zeros_like(ca_shi) - 1
     ca_gal[ind_in_gal] = ca_shi_gal[ca_shi[ind_in_gal]]
 
@@ -345,30 +349,49 @@ def load_particles(sim, include_parents=True):
         The offsets of individual particle types in the ID list.
     """ 
 
-    all_ids = np.zeros(0, dtype = int)
-    all_gal = np.zeros(0, dtype = int)
-    all_ages = np.zeros(0, dtype = float)
-    ptype_offset = np.zeros(9, dtype = int)
+    all_ids = np.zeros(0, dtype=int)
+    all_gal = np.zeros(0, dtype=int)
+    all_ages = np.zeros(0, dtype=float)
+    all_logradii = np.zeros(0, dtype=float)
+    ptype_offset = np.zeros(9, dtype=int)
 
-    # Loop through individual (to-be-considered) particle types:
-    for iiptype in ptypeList:
+    #cantor_dir = f'{sim.high_level_dir}/Cantor'
+    #cantorloc = f'{cantor_dir}/Cantor_{snap_z0:03d}.hdf5'
+    #cantoridloc = f'{cantor_dir}/Cantor_{snap_z0:03d}_IDs.hdf5'
+    #cantorradloc = f'{cantor_dir}/Cantor_{snap_z0:03d}_Radii.hdf5'
+
+    #ca_logradii = np.log10(hd.read_data(cantorradloc, 'Radius'))
+    #ca_ids = hd.read_data(cantoridloc, 'IDs')
+    #ca_revIDs = hy.crossref.ReverseList(ca_ids)
     
+    # Loop through individual (to-be-considered) particle types:
+    for iiptype in ptypeList:    
+        print(f"   ... ptype {iiptype}...")
+
         # Load all IDs at z = 0 and identify their z = 0 host galaxy
         ptype = hy.SplitFile(
-            sim.get_snap_dir(snap_z0), part_type=iiptype, verbose=0)
-        ptype_gal, ptype_in_gal = find_galaxy_for_ids(
-            sim, ptype.ParticleIDs, snap_z0, ptype=iiptype, check_cont=True)
+            sim.get_snap_file(snap_z0), part_type=iiptype, verbose=0)
+        ptype_gal, ptype_in_gal, rad_gal = find_galaxy_for_ids(
+            sim, ptype.ParticleIDs, snap_z0, ptype=iiptype, check_cont=True,
+            return_rad=True
+        )
 
         # Only keep particles that are in one of the input galaxies.
         # (`catInd` is non-negative only for input galaxies)
         subind_in_cat = np.nonzero(catInd[ptype_gal[ptype_in_gal]] >= 0)[0]
         ptype_in_cat = ptype_in_gal[subind_in_cat]
 
-        # Now append matches to full list (across ptypes):
-        all_ids = np.concatenate((all_ids, ptype.ParticleIDs[ptype_in_cat]))
+        # Now append matches to full list (across ptypes). We must cast 
+        # .ParticleID explicitly to int, because the concatenation otherwise
+        # converts to float...
+        all_ids = np.concatenate(
+            (all_ids, ptype.ParticleIDs[ptype_in_cat].astype(int)))
         all_gal = np.concatenate((all_gal, ptype_gal[ptype_in_cat]))
         ptype_offset[iiptype+1:] += len(ptype_in_cat)
 
+        all_logradii = np.concatenate(
+            (all_logradii, np.log10(rad_gal[ptype_in_cat])))
+        
         # Also need to record the formation time of each particle.
         if iiptype == 4:
             ptype_ft = ptype.StellarFormationTime
@@ -395,7 +418,7 @@ def load_particles(sim, include_parents=True):
                 ))
                 all_ages = np.concatenate((
                     all_ages,
-                    all_ages[ptype_offset[iiParType];ptype_offset[iiParType+1]]
+                    all_ages[ptype_offset[iiParType]:ptype_offset[iiParType+1]]
                 ))
 
                 # Increase offsets for last `types' (stored beyond pt-5):    
@@ -407,7 +430,9 @@ def load_particles(sim, include_parents=True):
     data['IDs'] = all_ids
     data['z0_Galaxies'] = all_gal
     data['FormationTimes'] = all_ages
+    data['LogRadii'] = all_logradii
     data['PtypeOffsets'] = ptype_offset
+    print(f"   ... loaded {len(all_ids)}...")
     return data
 
 
@@ -440,9 +465,12 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
     root_masses = root_data['masses']
     root_logradii = root_data['logradii']
     all_tass = root_data['assembly_times']
+    all_rass = root_data['assembly_radii']
 
     all_ids = particle_data['IDs']
     all_ages = particle_data['FormationTimes']
+    ptype_offset = particle_data['PtypeOffsets']
+    all_gal_z0 = particle_data['z0_Galaxies']
 
     # Need to consider all particles that have not yet been marked as found.
     # This is different depending on rootType: if "first", we only consider
@@ -459,7 +487,7 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
 
     np_snap = len(ind_part_ts)
     if np_snap == 0:
-        return
+        return root_data
     print(f"Processing {np_snap} particles in snapshot {isnap}...")
 
     # Extract current gal-->cantorID list, for simplicity:
@@ -467,11 +495,13 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
 
     # ** Key part: **
     # Identify the galaxy (if any) of all currently-considered particles
-    ts_gal, ts_ind_in_gal, rad_gal = find_galaxy_for_ids(
-        sim, all_ids[ind_part_ts], isnap, ptype_offset, return_rad=True)
+    ts_gal, ts_ind_in_gal, ts_rad_gal = find_galaxy_for_ids(
+        sim, all_ids[ind_part_ts], isnap, ptype_offset=ptype_offset,
+        return_rad=True
+    )
     np_gal = len(ts_ind_in_gal)
     print(f"... of which {np_gal} are in a galaxy...")
-    if np_gal == 0: return
+    if np_gal == 0: return root_data
 
     # Now check which identifications are 'valid', which depends on the 
     # program settings (prefix 'ig' --> 'in_gal'), and also requires knowing
@@ -496,13 +526,13 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
         # Use prefix 'tsg' --> this snap, in gal. Recall, `ind_part_ts` is
         # the index of currently tested particles into the full list.
         tsg_gal = ts_gal[ts_ind_in_gal]
-        tsg_old_root = all_rootGal[ind_part_ts[ts_ind_in_gal]]
+        tsg_old_root = root_galaxies[ind_part_ts[ts_ind_in_gal]]
         tsg_z0gal = all_gal_z0[ind_part_ts[ts_ind_in_gal]]
         tsg_msub = msub[cantorIDs[tsg_gal]]
-        tsg_root_mass = all_rootMass[ind_part_ts[ts_ind_in_gal]]
+        tsg_root_mass = root_masses[ind_part_ts[ts_ind_in_gal]]
         if record_assembly:
-            tsg_tass = all_tass[ind_part_ts[ts_in_in_gal]]
-
+            tsg_tass = all_tass[ind_part_ts[ts_ind_in_gal]]
+            
         if rootType == 'strictly_last':
             # Also simple: (re-)attach anything that isn't in the z0 host
             subind_permitted = np.nonzero(tsg_old_root != tsg_z0gal)[0]
@@ -534,10 +564,20 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
         # Record the assembly time for particles that have just assembled
         if record_assembly:
             curr_time = snap_ages[isnap]
-            ind_assembled = np.nonzero(
+            
+            # Find particles that have just assembled (in z0 host, not before).
+            # We do not need to take the 'permitted' mask into account here,
+            # because we are now interested in anything that has just joined
+            # the z = 0 host.
+            subind_assembled = np.nonzero(
                 (tsg_tass < 0) & (tsg_gal == tsg_z0gal))[0]
-            tsg_tass[ind_assembled] = curr_time
-            all_tass[ind_part_ts[ts_ind_in_gal]] = tsg_tass   
+            ind_assembled = ind_part_ts[ts_in_in_gal[subind_assembled]]
+            
+            all_tass[ind_assembled] = curr_time
+
+            lograd_ass = np.log10(ts_rad_gal[ts_ind_in_gal[ind_assembled]])
+            all_rass[ind_assembled] = lograd_ass
+            set_trace()
 
     # For convenience: direct index of permitted into this-snap particles
     ts_permitted = ts_ind_in_gal[subind_permitted]
@@ -597,7 +637,7 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
 
     # Update root galaxy and mass for (re-)attached galaxies:
     root_galaxies[ind_attached] = ts_gal[ts_ind_attached]
-    root_masses[ind_attached] = msub[cantorIDs[all_rootGal[ind_attached]]]
+    root_masses[ind_attached] = msub[cantorIDs[root_galaxies[ind_attached]]]
 
     if scale_root_lograd:
         extra_shid = hd.read_data(cantorloc, 'Subhalo/Extra/SubhaloIndex')
@@ -607,9 +647,9 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
         shmr_gal = np.zeros(cantor_shi.shape[0]) - 1
         shmr_gal[cantor_galID[extra_shid]] = shmr_extra
         root_logradii[ind_attached] = (
-            rad_gal[ts_ind_attached] / shmr_gal[ts_gal[ts_ind_attached]])
+            ts_rad_gal[ts_ind_attached] / shmr_gal[ts_gal[ts_ind_attached]])
     else:
-        root_logradii[ind_attached] = np.log10(rad_gal[ts_ind_attached])
+        root_logradii[ind_attached] = np.log10(ts_rad_gal[ts_ind_attached])
 
     # Updating root snap is different in 'first' and 'last' mode, to match
     # the different identifications of eligible particles.
@@ -629,11 +669,11 @@ def process_snapshot(isnap, sim, root_data, particle_data, cantor_shi):
     if rootType == 'last' and forgetful_parents:
         curr_time = snap_ages[isnap]
         ind_forgetting = np.nonzero(
-            (all_ages > curr_aexp) & (ts_flag_attached == 0) &
-            (all_rootGal >= 0))[0]
-        all_rootGal[ind_forgetting] = -1
-        all_rootMass[ind_forgetting] = -1
-        all_rootLograd[ind_forgetting] = -1
+            (all_ages > curr_time) & (ts_flag_attached == 0) &
+            (root_galaxies >= 0))[0]
+        root_galaxies[ind_forgetting] = -1
+        root_masses[ind_forgetting] = -1
+        root_logradii[ind_forgetting] = -1
 
     # ============= Processing of current snapshot is finished =============
 
@@ -679,7 +719,8 @@ class SplitList:
         return self.argsort[self.splits[index]:self.splits[index+1]]  
 
 
-def bin_particles(particle_data, root_data, all_code, ptype, cat_gal_thissim):
+def bin_particles(
+        sim, particle_data, root_data, all_code, ptype, cat_gal_thissim):
     """
     Bin up the particles, either by origin code or by contributing galaxies.
 
@@ -710,8 +751,10 @@ def bin_particles(particle_data, root_data, all_code, ptype, cat_gal_thissim):
     all_hostLogRad = particle_data['LogRadii']
     if record_assembly:
         all_ages = root_data['assembly_times']
+        all_assemblyLogRad = root_data['assembly_lograd']
     else:
         all_ages = particle_data['FormationTimes']
+        all_assemblyLogRad = np.zeros_like(all_ages)
     ptype_offset = particle_data['PtypeOffsets']
 
     all_rootMass = root_data['masses']
@@ -731,9 +774,10 @@ def bin_particles(particle_data, root_data, all_code, ptype, cat_gal_thissim):
     pt_rootMass = all_rootMass[ip_off : ip_end]
     pt_hostGal = all_hostGal[ip_off : ip_end]
     pt_code = all_code[ip_off : ip_end]
-    pt_ft = all_ft[ip_off : ip_end]
-    pt_rootLograd = all_rootLograd[ip_off : ip_end]
-    pt_hostLograd = all_hostLograd[ip_off : ip_end]
+    pt_ages = all_ages[ip_off : ip_end]
+    pt_rootLograd = all_rootLogRad[ip_off : ip_end]
+    pt_hostLograd = all_hostLogRad[ip_off : ip_end]
+    pt_assemblyLograd = all_assemblyLogRad[ip_off : ip_end]
 
     # ----------------------------------------------------------------------
     # ---- Extract particle masses for in-galaxy-at-z0 particles ----
@@ -786,7 +830,7 @@ def bin_particles(particle_data, root_data, all_code, ptype, cat_gal_thissim):
     elif bin_type == 'origin':
         output = find_origin_matrix(
             sim, pt_mass, pt_hostGal, pt_hostLograd, pt_rootMass, pt_code,
-            pt_ages, pt_rootLograd, cat_gal_thissim
+            pt_ages, pt_rootLograd, pt_assemblyLograd, cat_gal_thissim
         )
     else:   
         print(f"Illegal bin_type '{bin_type}'!")
@@ -829,7 +873,7 @@ def find_top_galaxies(
             ind_rad = ind_thisHost[subind_thisRad]
 
             # Sum their masses for each individual root galaxy via histogram
-            mass_by_root = np.histogram(
+            mass_by_root, edges = np.histogram(
                 pt_rootGal[ind_rad], weights=pt_mass[ind_rad],
                 bins=np.arange(0, max_root_gal + 2)
             )
@@ -856,8 +900,10 @@ def form_bin_code_host_ci(host_gal):
 def form_bin_code_root_mass(root_mass):
     root_mass_span = root_mass_range[1] - root_mass_range[0]
     delta_m_root = root_mass_span / (root_mass_nbins-2)
-    root_mass_code = (
-        (pt_rootMass - root_mass_range[0]) / delta_m_root).astype(np.int8)
+    root_mass_code = (root_mass - root_mass_range[0]) / delta_m_root
+
+    # We need to clip before converting to int8 to avoid under-/overflow
+    root_mass_code = np.clip(root_mass_code, -127, 127).astype(np.int8)
     root_mass_code = np.clip(root_mass_code, -1, root_mass_nbins-2) + 1
     return root_mass_code
 
@@ -865,22 +911,30 @@ def form_bin_code_radius(pt_lograd, kind):
     if kind == 'host':
         bin_range = host_lograd_range
         num_bins = host_lograd_nbins
-    elif kind == 'root';
+    elif kind == 'root':
         bin_range = root_lograd_range
         num_bins = root_lograd_nbins
-
+    elif kind == 'ass':
+        bin_range = assembly_lograd_range
+        num_bins = assembly_lograd_nbins
+        
     delta_r_bin = (bin_range[1] - bin_range[0]) / (num_bins - 2)
     rad_code_float = (pt_lograd - bin_range[0]) / delta_r_bin
-    return np.floor(rad_code_float).astype(np.int8)
+    rad_code = np.clip(np.floor(rad_code_float), -127, 127).astype(np.int8)
+    rad_code = np.clip(rad_code, -1, num_bins - 2) + 1
+    return rad_code
 
 def form_bin_code_age(pt_ages):
+    """Convert float age into a discrete codes.
+    Note that there are no out-of-bounds values possible here. 
+    """
     delta_age = (age_range[1] - age_range[0]) / age_nbins
-    return ((pt_ages - age_range[0]) / delta_age).astype(np.int8)
-
+    age_code = np.clip((pt_ages - age_range[0]) / delta_age, -127, 127)
+    return age_code.astype(np.int8)
 
 def find_origin_matrix(
     sim, pt_mass, pt_hostGal, pt_hostLograd, pt_rootMass, pt_code, pt_ages,
-    pt_rootLograd, cat_gal_thissim
+    pt_rootLograd, pt_assemblyLograd, cat_gal_thissim
 ):
     """Bin up the pre-prepared particle data by origin code."""
 
@@ -888,26 +942,30 @@ def find_origin_matrix(
     ptc_host_ci = form_bin_code_host_ci(pt_hostGal)
     ptc_root_mass = form_bin_code_root_mass(pt_rootMass)
     ptc_host_radius = form_bin_code_radius(pt_hostLograd, kind='host')
-    ptc_stellar_age = form_bin_code_root_age(pt_ages)
+    ptc_stellar_age = form_bin_code_age(pt_ages)
     ptc_root_radius = form_bin_code_radius(pt_rootLograd, kind='root')
-    
+    ptc_assembly_radius = form_bin_code_radius(pt_assemblyLograd, kind='ass')
+
     # Bin up masses with histogram
-    num_pt = len(pt_host_ci)
-    full_matrix = np.zeros((num_pt, 5), dtype=np.int8)
-    full_matrix[:, 0] = ptc_host_ci
-    full_matrix[:, 1] = ptc_root_mass
-    full_matrix[:, 2] = ptc_host_radius
-    full_matrix[:, 3] = ptc_stellar_age
-    full_matrix[:, 4] = ptc_root_radius
+    num_pt = len(ptc_host_ci)
+    full_matrix = np.zeros((num_pt, 7), dtype=np.int8)
+    full_matrix[:, 0] = pt_code
+    full_matrix[:, 1] = ptc_host_ci
+    full_matrix[:, 2] = ptc_root_mass
+    full_matrix[:, 3] = ptc_host_radius
+    full_matrix[:, 4] = ptc_stellar_age
+    full_matrix[:, 5] = ptc_root_radius
+    full_matrix[:, 6] = ptc_assembly_radius
 
     bins = [
-        np.arange(n_host+1), np.arange(root_mass_nbins+1),
+        np.arange(8), np.arange(n_host+1), np.arange(root_mass_nbins+1),
         np.arange(host_lograd_nbins+1), np.arange(age_nbins+1),
-        np.arange(root_lograd_nbins+1)
+        np.arange(root_lograd_nbins+1), np.arange(assembly_lograd_nbins+1)
     ]
 
+    set_trace()
     print("Binning up masses... ", end = '', flush = True)
-    mass_binned = np.histogramdd(full_matrix, weights=pt_mass, bins=bins)
+    mass_binned, edg = np.histogramdd(full_matrix, weights=pt_mass, bins=bins)
 
     print("Sum of particle masses: ", np.sum(pt_mass))
     print("Sum of binned masses:   ", np.sum(mass_binned))
@@ -1011,7 +1069,7 @@ def get_particle_code(sim, root_data, particle_data):
     code[ind_alive[sssubind_otherfof]] = 4
     code[ind_alive[sssubind_samefof[ssssubind_stripped]]] = 3
     code[ind_alive[sssubind_samefof[ssssubind_qm]]] = 2
-    if np.min(ig_code < 0):
+    if np.min(code < 0):
         print("Why are some galaxies not assigned a code?!?")
         set_trace()
 
@@ -1057,21 +1115,18 @@ def main():
     global outloc, csi_age, ptypeList_plus, n_host
 
     # Set up MPI to enable processing different sims in parallel
-    comm = MPI.COMM_WORLD
-    numtasks = comm.Get_size()
-    rank = comm.Get_rank()
-
-    # For simplicity, let every rank write its own output file
-    outloc = outloc + '.' + str(rank) + '.hdf5'
-    os.makedirs(os.path.dirname(outloc), exist_ok=True)
-    if os.path.exists(outloc):
-        os.rename(outloc, outloc + '.old')
-    write_header(outloc)
+    if MPI is not None:
+        comm = MPI.COMM_WORLD
+        numtasks = comm.Get_size()
+        rank = comm.Get_rank()
+    else:
+        numtasks, rank = 1, 0
 
     # Set up a fine interpolant to easily compute stellar ages:
     zFine = np.arange(0, 20, 0.01)
+    aFine = 1 / (1 + zFine)
     ageFine = Planck13.age(zFine).value
-    csi_age = interp1d(zFine, ageFine, kind='cubic', fill_value='extrapolate')
+    csi_age = interp1d(aFine, ageFine, kind='cubic', fill_value='extrapolate')
 
     # Load input catalogue
     cat_sim = hd.read_data(clusterCatalogue, 'Sim')
@@ -1079,10 +1134,6 @@ def main():
     n_host = len(cat_sim)
     cat_input = {'sim': cat_sim, 'gal': cat_gal}
     print(f"There are {n_host} galaxies in the input catalogue.")
-
-    # Set up the full output matrices, since these will combine simulations.
-    # They contain the mass of particles split by the different categories.
-    output_matrices = set_up_output_matrices()
 
     # Set up an extended ptype list, in case we want to find origins and 
     # trace parents
@@ -1093,28 +1144,45 @@ def main():
                 ptypeList_plus.append(6)
             if 5 in ptypeList:
                 ptypeList_plus.append(7)
+    else:
+        ptypeList_plus = ptypeList
+
+    # Set up the full output matrices, since these will combine simulations.
+    # They contain the mass of particles split by the different categories.
+    if bin_type == 'origin':
+        output_matrices = set_up_output_matrices_origin()
+    else:
+        output_matrices = set_up_output_matrices_topgal()
+
+    # For simplicity, let every rank write its own output file
+    outloc = outloc + '.' + str(rank) + '.hdf5'
+    os.makedirs(os.path.dirname(outloc), exist_ok=True)
+    if os.path.exists(outloc):
+        os.rename(outloc, outloc + '.old')
+    write_header(outloc)
 
     for isim in range(n_sim):
 
-        # Skip this one if we are multi-threading and it's not for this task to 
+        # Skip this one if we're multi-threading and it's not for this task to 
         # worry about
         if not isim % numtasks == rank:
+            print(f"Skipping {isim}...")
             continue
 
-        process_sim(isim, cat_input)
+        process_sim(isim, cat_input, output_matrices)
 
-print("Done!")
+    print("Done!")
 
 
-def process_sim(isim, cat_input):
+def process_sim(isim, cat_input, output_matrices):
     """Main top-level function to process one simulation."""
     sim_stime = time.time()
 
-    global catInd
+    global catInd, contFlag, cantor_shi, snap_ages
 
     print("")
     print("**************************")
-    print(f"Now processing halo CE-{:isim}")
+    print(f"Now processing halo CE-{isim}")
     print("**************************")
     print("")
     sys.stdout.flush()
@@ -1126,16 +1194,17 @@ def process_sim(isim, cat_input):
         sim = hy.Simulation(isim)
     if not os.path.exists(sim.run_dir):
         print("Can not find simulation directory...")
-        continue
+        return
+    sim.isim = isim
 
     # Find which galaxies need processing from this sim
     cat_thissim = np.nonzero(cat_input['sim'] == isim)[0]
     if len(cat_thissim) == 0:
         print(f"No galaxies required from simulation {isim}, exiting...")
-        continue
+        return
     else:
         print(f"Simulation {isim}: {len(cat_thissim)} target galaxies.")
-        cat_gal_thissim = cat_input['sim'][cat_thissim]
+        cat_gal_thissim = cat_input['gal'][cat_thissim]
 
     # Set up files to load particles from.
     snapdir_z0 = sim.get_snapshot_file(snap_z0)
@@ -1143,7 +1212,7 @@ def process_sim(isim, cat_input):
     cantor_dir = sim.high_level_dir + '/Cantor/'
     if not os.path.exists(cantor_dir):
         print(f"Cannot find cantor catalogue at '{cantorloc}'...")
-        continue
+        return
 
     # We will need the age of the Universe at z = 0 for stellar ages
     snap_ages = hy.snep_times(time_type='age', snep_list='allsnaps')
@@ -1167,7 +1236,7 @@ def process_sim(isim, cat_input):
     print("Done with setup, now loading particles...", flush=True)
  
     # Load particle IDs for in-galaxy-at-z=0 particles:
-    particle_data = load_particles()
+    particle_data = load_particles(sim)
     numPart = particle_data['NumberOfParticles']
     all_gal_z0 = particle_data['z0_Galaxies']
 
@@ -1190,9 +1259,15 @@ def process_sim(isim, cat_input):
     root_data['galaxies'] = np.zeros(numPart, dtype = np.int32) - 1
     root_data['masses'] = np.zeros(numPart, dtype = np.float32) - 1
     root_data['logradii'] = np.zeros(numPart, dtype = np.float32) + 1000
+    if record_assembly:
+        root_data['assembly_times'] = np.zeros(numPart, dtype=np.float32) - 1
+        root_data['assembly_radii'] = np.zeros(numPart, dtype=np.float32) - 1
+    else:
+        root_data['assembly_times'] = None
+        root_data['assembly_radii'] = None
 
     # === Core processing step: find root galaxies for all particles ===
-    for isnap in range(nsnap):
+    for isnap in range(5): # nsnap):
         root_data = process_snapshot(
             isnap, sim, root_data, particle_data, cantor_shi)
 
@@ -1200,7 +1275,7 @@ def process_sim(isim, cat_input):
     print("Now determining origin code for all particles...")
     
     # Determine 'type-code' for all (in-z0-gal) particles:
-    all_code = get_particle_code(root_data, particle_data)
+    all_code = get_particle_code(sim, root_data, particle_data)
 
     print("Binning up particle masses for each type...")    
     for ptype in ptypeList:
@@ -1208,11 +1283,8 @@ def process_sim(isim, cat_input):
         # *** Different in this version: instead of origin code, we find
         # *** the 30 most-contributing galaxies in each radial bin (for each
         # *** host separately). All others are grouped in `gal 30'.
-        if bin_type == 'topgal':
-            mass_binned = bin_particles_topgal(particle_data, root_data, ptype)
-        elif bin_type == 'origin':
-            mass_binned = bin_particles(
-                particle_data, root_data, all_code, ptype)
+        mass_binned = bin_particles(
+            sim, particle_data, root_data, all_code, ptype, cat_gal_thissim)
 
         # Now combine results across simulations and write
         output_matrices[ptype][isim, ...] = mass_binned.astype(np.float32)
@@ -1239,10 +1311,15 @@ def set_up_output_matrices_origin():
     for ptype in [0, 1, 4, 5, 6, 7]:
         if ptype in ptypeList_plus:
             mass_binned = np.zeros(
-                (n_sim, 7, n_host, 1, root_mass_nbins, host_lograd_nbins, 1,
-                 age_nbins, root_lograd_nbins),
+                (n_sim, 7, n_host, root_mass_nbins, host_lograd_nbins,
+                 age_nbins, root_lograd_nbins, assembly_lograd_nbins),
                 dtype=np.float32
             )
             data[ptype] = mass_binned
     return data
 
+
+
+if __name__ == "__main__":
+    main()
+    print("Done!")
