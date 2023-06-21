@@ -10,7 +10,7 @@ import hydrangea.hdf5 as hd
 from pdb import set_trace
 import os
 
-outloc = ('cluster_catalogue_z0_20Jun23_merge1p10_wSFR.hdf5')
+outloc = ('cluster_catalogue_z0_21Jun23_merge1p10_wSFR.hdf5')
 
 isnap = 29    # Snapshot in which clusters are selected
 
@@ -160,14 +160,14 @@ for isim in range(30):
     # Ends loop through clusters
 # Ends loop through simulations
 
-hd.write_data(outloc, 'Sim', full_sim[:curr_cl], new=True)
-hd.write_data(outloc, 'Galaxy', full_gal[:curr_cl])
-hd.write_data(outloc, 'M200c', full_m200[:curr_cl])
-hd.write_data(outloc, 'MstarAll', full_mstar_all[:curr_cl])
-hd.write_data(outloc, 'MstarCantor', full_mstar_ca[:curr_cl])
-hd.write_data(outloc, 'MstarSubfind', full_mstar_sf[:curr_cl])
-hd.write_data(outloc, 'RelaxTime', full_relaxTime[:curr_cl])
-hd.write_data(outloc, 'SFR_30kpc', full_sfr_30kpc[:curr_cl])
-hd.write_data(outloc, 'R200c', full_r200[:curr_cl])
+hd.write_data(outloc, 'Sim', full_sim[:curr_cl+1], new=True)
+hd.write_data(outloc, 'Galaxy', full_gal[:curr_cl+1])
+hd.write_data(outloc, 'M200c', full_m200[:curr_cl+1])
+hd.write_data(outloc, 'MstarAll', full_mstar_all[:curr_cl+1])
+hd.write_data(outloc, 'MstarCantor', full_mstar_ca[:curr_cl+1])
+hd.write_data(outloc, 'MstarSubfind', full_mstar_sf[:curr_cl+1])
+hd.write_data(outloc, 'RelaxTime', full_relaxTime[:curr_cl+1])
+hd.write_data(outloc, 'SFR_30kpc', full_sfr_30kpc[:curr_cl+1])
+hd.write_data(outloc, 'R200c', full_r200[:curr_cl+1])
 
 print("Done!")
