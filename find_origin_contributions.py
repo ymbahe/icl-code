@@ -72,7 +72,7 @@ ptypeList = [4]           # List of particle types to process
 cantorCatalogue = 'CantorCatalogue.hdf5' 
 
 # File name of *cluster* catalogue to use as input:
-clusterCatalogue = ('../cluster_catalogue_z0_22Jul19_merge1p10_wSFR.hdf5')
+clusterCatalogue = ('cluster_catalogue_z0_20Jun23_merge1p10_wSFR_CE0only.hdf5')
 
 # Next line specifies the minimum mass of a subhalo to be considered as 
 # 'containing' a particle, in units of the particle's z = 0 host.
@@ -1267,7 +1267,7 @@ def process_sim(isim, cat_input, output_matrices):
         root_data['assembly_radii'] = None
 
     # === Core processing step: find root galaxies for all particles ===
-    for isnap in range(5): # nsnap):
+    for isnap in range(nsnap):
         root_data = process_snapshot(
             isnap, sim, root_data, particle_data, cantor_shi)
 
