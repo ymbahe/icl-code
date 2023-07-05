@@ -143,7 +143,7 @@ for isim in range(30):
             )[0]
             if len(ind_acc) == 0: continue
 
-            m200_pre = np.max(m200_all[ind_acc, :isnap_back])
+            m200_pre = np.max(m200_all[ind_acc, isnap_back - 1])
             m200_self = m200_all[icl, isnap_back-1]
             print(f"Max merger in snap {isnap_back}: "
                   f"{m200_pre:.2f} vs. {m200_self:.2f}") 
